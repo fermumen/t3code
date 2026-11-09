@@ -45,15 +45,14 @@ jobs:
       T3CODE_RELAY_URL: https://relay.t3.codes
     steps:
       - name: Checkout upstream source
-        uses: actions/checkout@v6
-        with:
-          repository: pingdotgg/t3code
-          ref: ${{ inputs.ref }}
-          persist-credentials: false
-          sparse-checkout-cone-mode: false
-          sparse-checkout: |
-            /*
-            !/.repos/
+        env:
+          SOURCE_REF: ${{ inputs.ref }}
+        run: |
+          git init .
+          git remote add origin https://github.com/pingdotgg/t3code.git
+          git sparse-checkout set --no-cone '/*' '!/.repos/'
+          git fetch --depth=1 origin "$SOURCE_REF"
+          git checkout -b build FETCH_HEAD
       - name: Record source and select Xcode
         id: source
         shell: bash
