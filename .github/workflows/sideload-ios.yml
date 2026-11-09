@@ -1,0 +1,147 @@
+name: Sideload iOS (unsigned)
+
+on:
+  workflow_dispatch:
+    inputs:
+      ref:
+        description: Upstream branch, tag, or commit to build
+        default: main
+        required: true
+      bundle_id:
+        description: Separate app bundle identifier
+        default: com.fermumen.t3code.work
+        required: true
+      display_name:
+        description: Home screen name
+        default: T3 Work
+        required: true
+
+permissions:
+  contents: read
+
+concurrency:
+  group: sideload-ios
+  cancel-in-progress: false
+
+jobs:
+  build:
+    if: github.repository == 'fermumen/t3code'
+    runs-on: macos-26
+    timeout-minutes: 120
+    permissions:
+      contents: write
+    env:
+      CI: '1'
+      APP_VARIANT: production
+      T3CODE_IOS_PERSONAL_TEAM: '1'
+      T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID: ${{ inputs.bundle_id }}
+      DISPLAY_NAME: ${{ inputs.display_name }}
+      EXPO_NO_GIT_STATUS: '1'
+      T3CODE_MOBILE_UPDATES_ENABLED: '0'
+      NODE_OPTIONS: --max-old-space-size=8192
+      # Public production identifiers committed in upstream .env.example.
+      T3CODE_CLERK_PUBLISHABLE_KEY: pk_live_Y2xlcmsudDMuY29kZXMk
+      T3CODE_CLERK_JWT_TEMPLATE: t3-relay
+      T3CODE_RELAY_URL: https://relay.t3.codes
+    steps:
+      - name: Checkout upstream source
+        uses: actions/checkout@v6
+        with:
+          repository: pingdotgg/t3code
+          ref: ${{ inputs.ref }}
+          persist-credentials: false
+      - name: Record source and select Xcode
+        id: source
+        shell: bash
+        run: |
+          sudo xcode-select -s /Applications/Xcode_26.6.app/Contents/Developer
+          xcodebuild -version
+          echo "sha=$(git rev-parse HEAD)" >> "$GITHUB_OUTPUT"
+          echo "version=$(git describe --tags --always | tr -c 'A-Za-z0-9.\n-' '-')" >> "$GITHUB_OUTPUT"
+      - name: Setup repository toolchain and dependencies
+        uses: ./.github/actions/setup-ci-deps
+      - name: Verify pinned package manager
+        run: |
+          npm install --global corepack
+          corepack enable
+          corepack prepare pnpm@12.14.0 --activate
+          node --version
+          pnpm --version
+      - name: Cache CocoaPods downloads
+        uses: actions/cache@v6
+        with:
+          path: ~/Library/Caches/CocoaPods
+          key: pods-${{ runner.os }}-${{ runner.arch }}-${{ hashFiles('pnpm-lock.yaml') }}
+          restore-keys: pods-${{ runner.os }}-${{ runner.arch }}-
+      - name: Generate native project
+        working-directory: apps/mobile
+        run: pnpm exec expo prebuild --clean --platform ios --no-install
+      - name: Install pods
+        working-directory: apps/mobile/ios
+        run: pod install
+      - name: Archive unsigned Release with embedded JavaScript
+        working-directory: apps/mobile
+        shell: bash
+        run: |
+          set -o pipefail
+          workspace=$(find ios -maxdepth 1 -name '*.xcworkspace' -print -quit)
+          scheme=$(basename "$workspace" .xcworkspace)
+          xcodebuild -workspace "$workspace" -scheme "$scheme" \
+            -configuration Release -destination 'generic/platform=iOS' \
+            -archivePath "$RUNNER_TEMP/T3Work.xcarchive" \
+            CODE_SIGNING_ALLOWED=NO CODE_SIGNING_REQUIRED=NO CODE_SIGN_IDENTITY="" \
+            DEVELOPMENT_TEAM="" archive 2>&1 | tee "$RUNNER_TEMP/xcodebuild.log" | xcbeautify
+      - name: Package and verify unsigned IPA
+        env:
+          VERSION: ${{ steps.source.outputs.version }}
+          SOURCE_SHA: ${{ steps.source.outputs.sha }}
+        shell: bash
+        run: |
+          set -euo pipefail
+          mkdir -p "$RUNNER_TEMP/package/Payload" dist
+          app=$(find "$RUNNER_TEMP/T3Work.xcarchive/Products/Applications" -maxdepth 1 -name '*.app' -print -quit)
+          test -n "$app"
+          /usr/libexec/PlistBuddy -c "Set :CFBundleDisplayName $DISPLAY_NAME" "$app/Info.plist"
+          test "$(/usr/libexec/PlistBuddy -c 'Print :CFBundleIdentifier' "$app/Info.plist")" = "$T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID"
+          test -s "$app/main.jsbundle"
+          test ! -e "$app/embedded.mobileprovision"
+          test ! -d "$app/PlugIns"
+          test ! -d "$app/Extensions"
+          if codesign -dv "$app" 2>/dev/null; then
+            echo 'Expected unsigned app'; exit 1
+          fi
+          cp -R "$app" "$RUNNER_TEMP/package/Payload/"
+          ipa="T3Work-$VERSION-unsigned.ipa"
+          (cd "$RUNNER_TEMP/package" && zip -qry "$GITHUB_WORKSPACE/dist/$ipa" Payload)
+          shasum -a 256 "dist/$ipa" > "dist/$ipa.sha256"
+          {
+            echo "Source: pingdotgg/t3code@$SOURCE_SHA"
+            echo "Bundle: $T3CODE_IOS_PERSONAL_TEAM_BUNDLE_ID"
+            echo "Name: $DISPLAY_NAME"
+            echo 'Unsigned Release; embedded main.jsbundle; no extensions or provisioning profile.'
+            xcodebuild -version
+            ls -lh "dist/$ipa"
+          } | tee dist/BUILD.txt >> "$GITHUB_STEP_SUMMARY"
+      - name: Upload IPA artifact
+        uses: actions/upload-artifact@v7
+        with:
+          name: T3Work-unsigned
+          path: dist/*
+          if-no-files-found: error
+      - name: Publish fork release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          GH_REPO: ${{ github.repository }}
+          VERSION: ${{ steps.source.outputs.version }}
+          WORKFLOW_SHA: ${{ github.sha }}
+        run: |
+          gh release create "sideload-$VERSION-$GITHUB_RUN_NUMBER" dist/* \
+            --target "$WORKFLOW_SHA" --title "T3 Work $VERSION (unsigned)" \
+            --notes-file dist/BUILD.txt
+      - name: Upload build log on failure
+        if: failure()
+        uses: actions/upload-artifact@v7
+        with:
+          name: xcodebuild-log
+          path: ${{ runner.temp }}/xcodebuild.log
+          if-no-files-found: ignore
