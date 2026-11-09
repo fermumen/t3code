@@ -50,6 +50,10 @@ jobs:
           repository: pingdotgg/t3code
           ref: ${{ inputs.ref }}
           persist-credentials: false
+          sparse-checkout-cone-mode: false
+          sparse-checkout: |
+            /*
+            !/.repos/
       - name: Record source and select Xcode
         id: source
         shell: bash
